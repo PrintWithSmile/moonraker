@@ -10,13 +10,16 @@ import os
 import logging
 import time
 import tempfile
-from .common import AppType, get_base_configuration, get_app_type
+import pathlib
+from .common import AppType, get_base_configuration
 from .base_deploy import BaseDeploy
 from .app_deploy import AppDeploy
 from .git_deploy import GitDeploy
 from .zip_deploy import ZipDeploy
+from .python_deploy import PythonDeploy
 from .system_deploy import PackageDeploy
-from .web_deploy import WebClientDeploy
+from ...common import RequestType
+from ...utils.filelock import AsyncExclusiveFileLock, LockTimeout
 
 # Annotation imports
 from typing import (
@@ -36,7 +39,7 @@ if TYPE_CHECKING:
     from ...server import Server
     from ...confighelper import ConfigHelper
     from ...common import WebRequest
-    from ...klippy_connection import KlippyConnection
+    from ..klippy_connection import KlippyConnection
     from ..shell_command import ShellCommandFactory as SCMDComp
     from ..database import MoonrakerDatabase as DBComp
     from ..database import NamespaceWrapper
@@ -48,17 +51,16 @@ if TYPE_CHECKING:
 
 # Check To see if Updates are necessary each hour
 UPDATE_REFRESH_INTERVAL = 3600.
-# Perform auto refresh no later than 4am
-MAX_UPDATE_HOUR = 4
 
 def get_deploy_class(
     app_type: Union[AppType, str], default: _T
 ) -> Union[Type[BaseDeploy], _T]:
     key = AppType.from_string(app_type) if isinstance(app_type, str) else app_type
     _deployers = {
-        AppType.WEB: WebClientDeploy,
+        AppType.WEB: ZipDeploy,
         AppType.GIT_REPO: GitDeploy,
-        AppType.ZIP: ZipDeploy
+        AppType.ZIP: ZipDeploy,
+        AppType.PYTHON: PythonDeploy
     }
     return _deployers.get(key, default)
 
@@ -66,10 +68,24 @@ class UpdateManager:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
+        self.instance_tracker = InstanceTracker(self.server)
         self.kconn: KlippyConnection
         self.kconn = self.server.lookup_component("klippy_connection")
         self.app_config = get_base_configuration(config)
+
         auto_refresh_enabled = config.getboolean('enable_auto_refresh', False)
+        self.refresh_window = config.getintlist('refresh_window', [0, 5],
+                                                separator='-', count=2)
+        if (
+            not (0 <= self.refresh_window[0] <= 23) or
+            not (0 <= self.refresh_window[1] <= 23)
+        ):
+            raise config.error("The hours specified in 'refresh_window'"
+                               " must be between 0 and 23.")
+        if self.refresh_window[0] == self.refresh_window[1]:
+            raise config.error("The start and end hours specified"
+                               " in 'refresh_window' cannot be the same.")
+
         self.cmd_helper = CommandHelper(config, self.get_updaters)
         self.updaters: Dict[str, BaseDeploy] = {}
         if config.getboolean('enable_system_updates', True):
@@ -116,7 +132,8 @@ class UpdateManager:
                     self.updaters[name] = deployer(cfg, self.cmd_helper)
             except Exception as e:
                 self.server.add_warning(
-                    f"[update_manager]: Failed to load extension {name}: {e}"
+                    f"[update_manager]: Failed to load extension {name}: {e}",
+                    exc_info=e
                 )
 
         self.cmd_request_lock = asyncio.Lock()
@@ -130,32 +147,32 @@ class UpdateManager:
                 self._handle_auto_refresh)
 
         self.server.register_endpoint(
-            "/machine/update/moonraker", ["POST"],
-            self._handle_update_request)
+            "/machine/update/moonraker", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/klipper", ["POST"],
-            self._handle_update_request)
+            "/machine/update/klipper", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/system", ["POST"],
-            self._handle_update_request)
+            "/machine/update/system", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/client", ["POST"],
-            self._handle_update_request)
+            "/machine/update/client", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/full", ["POST"],
-            self._handle_full_update_request)
+            "/machine/update/full", RequestType.POST, self._handle_full_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/status", ["GET"],
-            self._handle_status_request)
+            "/machine/update/status", RequestType.GET, self._handle_status_request
+        )
         self.server.register_endpoint(
-            "/machine/update/refresh", ["POST"],
-            self._handle_refresh_request)
+            "/machine/update/refresh", RequestType.POST, self._handle_refresh_request
+        )
         self.server.register_endpoint(
-            "/machine/update/recover", ["POST"],
-            self._handle_repo_recovery)
+            "/machine/update/recover", RequestType.POST, self._handle_repo_recovery
+        )
         self.server.register_endpoint(
-            "/machine/update/rollback", ["POST"],
-            self._handle_rollback)
+            "/machine/update/rollback", RequestType.POST, self._handle_rollback
+        )
         self.server.register_notification("update_manager:update_response")
         self.server.register_notification("update_manager:update_refreshed")
 
@@ -167,6 +184,7 @@ class UpdateManager:
         return self.updaters
 
     async def component_init(self) -> None:
+        await self.instance_tracker.set_instance_id()
         # Prune stale data from the database
         umdb = self.cmd_helper.get_umdb()
         db_keys = await umdb.keys()
@@ -186,51 +204,50 @@ class UpdateManager:
     def _set_klipper_repo(self) -> None:
         if self.klippy_identified_evt is not None:
             self.klippy_identified_evt.set()
-        kinfo = self.server.get_klippy_info()
-        if not kinfo:
-            logging.info("No valid klippy info received")
-            return
-        kpath: str = kinfo['klipper_path']
-        executable: str = kinfo['python_path']
+
+        kconn: KlippyConnection = self.server.lookup_component("klippy_connection")
         kupdater = self.updaters.get('klipper')
-        app_type = get_app_type(kpath)
+        app_type = AppType.detect(kconn.path)
         if (
             (isinstance(kupdater, AppDeploy) and
-             kupdater.check_same_paths(kpath, executable)) or
+             kupdater.check_same_paths(kconn.path, kconn.executable)) or
             (app_type == AppType.NONE and type(kupdater) is BaseDeploy)
         ):
             # Current Klipper Updater is valid or unnecessary
             return
-        # Update paths in the database
-        db: DBComp = self.server.lookup_component('database')
-        db.insert_item("moonraker", "update_manager.klipper_path", kpath)
-        db.insert_item("moonraker", "update_manager.klipper_exec", executable)
         kcfg = self.app_config["klipper"]
-        kcfg.set_option("path", kpath)
-        kcfg.set_option("env", executable)
+        kcfg.set_option("path", str(kconn.path))
+        kcfg.set_option("env", str(kconn.executable))
         kcfg.set_option("type", str(app_type))
-        need_notification = not isinstance(kupdater, AppDeploy)
+        notify = not isinstance(kupdater, AppDeploy)
         kclass = get_deploy_class(app_type, BaseDeploy)
-        self.updaters['klipper'] = kclass(kcfg, self.cmd_helper)
-        coro = self._update_klipper_repo(need_notification)
+        coro = self._update_klipper_repo(kclass(kcfg, self.cmd_helper), notify)
         self.event_loop.create_task(coro)
 
-    async def _update_klipper_repo(self, notify: bool) -> None:
+    async def _update_klipper_repo(self, updater: BaseDeploy, notify: bool) -> None:
         async with self.cmd_request_lock:
+            self.updaters['klipper'] = updater
             umdb = self.cmd_helper.get_umdb()
             await umdb.pop('klipper', None)
-            await self.updaters['klipper'].initialize()
-            await self.updaters['klipper'].refresh()
+            await updater.initialize()
+            await updater.refresh()
         if notify:
             self.cmd_helper.notify_update_refreshed()
 
-    async def _handle_auto_refresh(self, eventtime: float) -> float:
+    def _is_within_refresh_window(self) -> bool:
         cur_hour = time.localtime(time.time()).tm_hour
+        if self.refresh_window[0] < self.refresh_window[1]:
+            return self.refresh_window[0] <= cur_hour < self.refresh_window[1]
+        return cur_hour >= self.refresh_window[0] or cur_hour < self.refresh_window[1]
+
+    async def _handle_auto_refresh(self, eventtime: float) -> float:
         log_remaining_time = True
         if self.initial_refresh_complete:
             log_remaining_time = False
-            # Update when the local time is between 12AM and 5AM
-            if cur_hour >= MAX_UPDATE_HOUR:
+            # Update only if within the refresh window
+            if not self._is_within_refresh_window():
+                logging.debug("update_manager: current time is outside of"
+                              " the refresh window, auto refresh rescheduled")
                 return eventtime + UPDATE_REFRESH_INTERVAL
             if self.kconn.is_printing():
                 # Don't Refresh during a print
@@ -477,6 +494,7 @@ class UpdateManager:
     async def close(self) -> None:
         if self.refresh_timer is not None:
             self.refresh_timer.stop()
+        await self.instance_tracker.close()
         for updater in self.updaters.values():
             ret = updater.close()
             if ret is not None:
@@ -495,10 +513,6 @@ class CommandHelper:
         config.getboolean('enable_repo_debug', False, deprecate=True)
         if self.server.is_debug_enabled():
             logging.warning("UPDATE MANAGER: REPO DEBUG ENABLED")
-        shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-        self.scmd_error = shell_cmd.error
-        self.build_shell_command = shell_cmd.build_shell_command
-        self.run_cmd_with_response = shell_cmd.exec_cmd
         self.pkg_updater: Optional[PackageDeploy] = None
 
         # database management
@@ -525,6 +539,9 @@ class CommandHelper:
 
     def get_server(self) -> Server:
         return self.server
+
+    def get_shell_command(self) -> SCMDComp:
+        return self.server.lookup_component("shell_command")
 
     def get_http_client(self) -> HttpClient:
         return self.http_client
@@ -578,18 +595,18 @@ class CommandHelper:
         cmd: str,
         timeout: float = 20.,
         notify: bool = False,
-        retries: int = 1,
+        attempts: int = 1,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
-        sig_idx: int = 1
+        sig_idx: int = 1,
+        log_stderr: bool = False
     ) -> None:
         cb = self.notify_update_response if notify else None
-        scmd = self.build_shell_command(cmd, callback=cb, env=env, cwd=cwd)
-        for _ in range(retries):
-            if await scmd.run(timeout=timeout, sig_idx=sig_idx):
-                break
-        else:
-            raise self.server.error("Shell Command Error")
+        log_stderr |= self.server.is_verbose_enabled()
+        await self.get_shell_command().run_cmd_async(
+            cmd, cb, timeout=timeout, attempts=attempts,
+            env=env, cwd=cwd, sig_idx=sig_idx, log_stderr=log_stderr
+        )
 
     def notify_update_refreshed(self) -> None:
         vinfo: Dict[str, Any] = {}
@@ -647,6 +664,67 @@ class CommandHelper:
 
         eventloop = self.server.get_event_loop()
         return await eventloop.run_in_thread(_createdir, suffix, prefix)
+
+class InstanceTracker:
+    def __init__(self, server: Server) -> None:
+        self.server = server
+        self.inst_id = ""
+        tmpdir = pathlib.Path(tempfile.gettempdir())
+        self.inst_file_path = tmpdir.joinpath("moonraker_instance_ids")
+
+    def get_instance_id(self) -> str:
+        machine: Machine = self.server.lookup_component("machine")
+        cur_name = "".join(machine.unit_name.split())
+        cur_uuid: str = self.server.get_app_args()["instance_uuid"]
+        pid = os.getpid()
+        return f"{cur_name}:{cur_uuid}:{pid}"
+
+    async def _read_instance_ids(self) -> List[str]:
+        if not self.inst_file_path.exists():
+            return []
+        eventloop = self.server.get_event_loop()
+        id_data = await eventloop.run_in_thread(self.inst_file_path.read_text)
+        return [iid.strip() for iid in id_data.strip().splitlines() if iid.strip()]
+
+    async def set_instance_id(self) -> None:
+        try:
+            async with AsyncExclusiveFileLock(self.inst_file_path, 2.):
+                self.inst_id = self.get_instance_id()
+                iids = await self._read_instance_ids()
+                if self.inst_id not in iids:
+                    iids.append(self.inst_id)
+                iid_string = "\n".join(iids)
+                if len(iids) > 1:
+                    self.server.add_log_rollover_item(
+                        "um_multi_instance_msg",
+                        "Multiple instances of Moonraker have the update "
+                        f"manager enabled.\n{iid_string}"
+                    )
+                eventloop = self.server.get_event_loop()
+                await eventloop.run_in_thread(
+                    self.inst_file_path.write_text, iid_string
+                )
+        except LockTimeout as e:
+            logging.info(str(e))
+        except Exception:
+            logging.exception("Failed to set instance id")
+
+    async def close(self) -> None:
+        try:
+            async with AsyncExclusiveFileLock(self.inst_file_path, 2.):
+                # Remove current id
+                iids = await self._read_instance_ids()
+                if self.inst_id in iids:
+                    iids.remove(self.inst_id)
+                iid_string = "\n".join(iids)
+                eventloop = self.server.get_event_loop()
+                await eventloop.run_in_thread(
+                    self.inst_file_path.write_text, iid_string
+                )
+        except LockTimeout as e:
+            logging.info(str(e))
+        except Exception:
+            logging.exception("Failed to remove instance id")
 
 
 def load_component(config: ConfigHelper) -> UpdateManager:

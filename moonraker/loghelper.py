@@ -11,7 +11,9 @@ import time
 import os
 import sys
 import asyncio
+import platform
 from queue import SimpleQueue as Queue
+from .common import RequestType
 
 # Annotation imports
 from typing import (
@@ -26,7 +28,7 @@ from typing import (
 if TYPE_CHECKING:
     from .server import Server
     from .common import WebRequest
-    from .klippy_connection import KlippyConnection
+    from .components.klippy_connection import KlippyConnection
 
 # Coroutine friendly QueueHandler courtesy of Martjin Pieters:
 # https://www.zopatista.com/python/2019/05/11/asyncio-logging/
@@ -60,6 +62,7 @@ class MoonrakerLoggingHandler(logging.handlers.TimedRotatingFileHandler):
         strtime = time.asctime(time.gmtime())
         header = f"{'-'*20} Log Start | {strtime} {'-'*20}\n"
         self.stream.write(header)
+        self.stream.write(f"platform: {platform.platform(terse=True)}\n")
         app_section = "\n".join([f"{k}: {v}" for k, v in self.app_args.items()])
         self.stream.write(app_section + "\n")
         if self.rollover_info:
@@ -81,7 +84,8 @@ class LogManager:
         stdout_fmt = logging.Formatter(
             '[%(filename)s:%(funcName)s()] - %(message)s')
         stdout_hdlr.setFormatter(stdout_fmt)
-        app_args_str = "\n".join([f"{k}: {v}" for k, v in app_args.items()])
+        app_args_str = f"platform: {platform.platform(terse=True)}\n"
+        app_args_str += "\n".join([f"{k}: {v}" for k, v in app_args.items()])
         sys.stdout.write(f"\nApplication Info:\n{app_args_str}\n")
         self.file_hdlr: Optional[MoonrakerLoggingHandler] = None
         self.listener: Optional[logging.handlers.QueueListener] = None
@@ -112,7 +116,7 @@ class LogManager:
     def set_server(self, server: Server) -> None:
         self.server = server
         self.server.register_endpoint(
-            "/server/logs/rollover", ['POST'], self._handle_log_rollover
+            "/server/logs/rollover", RequestType.POST, self._handle_log_rollover
         )
 
     def set_rollover_info(self, name: str, item: str) -> None:
@@ -126,7 +130,8 @@ class LogManager:
         return eventloop.run_in_thread(self.file_hdlr.doRollover)
 
     def stop_logging(self):
-        self.listener.stop()
+        if self.listener is not None:
+            self.listener.stop()
 
     async def _handle_log_rollover(
         self, web_request: WebRequest

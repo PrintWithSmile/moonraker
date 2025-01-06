@@ -19,6 +19,9 @@ import re
 import struct
 import socket
 import enum
+import ipaddress
+import platform
+from .exceptions import ServerError
 from . import source_info
 from . import json_wrapper
 
@@ -39,11 +42,13 @@ if TYPE_CHECKING:
 
 SYS_MOD_PATHS = glob.glob("/usr/lib/python3*/dist-packages")
 SYS_MOD_PATHS += glob.glob("/usr/lib/python3*/site-packages")
+SYS_MOD_PATHS += glob.glob("/usr/lib/*-linux-gnu/python3*/site-packages")
+IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
-class ServerError(Exception):
-    def __init__(self, message: str, status_code: int = 400) -> None:
-        Exception.__init__(self, message)
-        self.status_code = status_code
+try:
+    KERNEL_VERSION = tuple([int(part) for part in platform.release().split(".")[:2]])
+except Exception:
+    KERNEL_VERSION = (0, 0)
 
 
 class Sentinel(enum.Enum):
@@ -264,3 +269,9 @@ def pretty_print_time(seconds: int) -> str:
             continue
         fmt_list.append(f"{val} {ident}" if val == 1 else f"{val} {ident}s")
     return ", ".join(fmt_list)
+
+def parse_ip_address(address: str) -> Optional[IPAddress]:
+    try:
+        return ipaddress.ip_address(address)
+    except Exception:
+        return None
